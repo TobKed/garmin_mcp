@@ -611,6 +611,196 @@ async def test_get_activity_exercise_sets_tool(app_with_activity_management, moc
     mock_garmin_client.get_activity_exercise_sets.assert_called_once_with(activity_id)
 
 
+def _recorded_exercise_sets():
+    """Watch-recorded sets: two active sets separated by rest, plus a phantom set."""
+    return {
+        "activityId": 12345678901,
+        "exerciseSets": [
+            {
+                "exercises": [{"category": "UNKNOWN", "name": None, "probability": 98.8}],
+                "duration": 30.0,
+                "repetitionCount": 14,
+                "weight": 0.0,
+                "setType": "ACTIVE",
+                "startTime": "2026-10-05T15:00:38.0",
+                "messageIndex": 0,
+            },
+            {
+                "exercises": [],
+                "duration": 90.0,
+                "repetitionCount": None,
+                "weight": None,
+                "setType": "REST",
+                "startTime": "2026-10-05T15:01:08.0",
+                "messageIndex": 1,
+            },
+            {
+                "exercises": [{"category": "SQUAT", "name": None, "probability": 57.0}],
+                "duration": 40.0,
+                "repetitionCount": 7,
+                "weight": 0.0,
+                "setType": "ACTIVE",
+                "startTime": "2026-10-05T15:02:38.0",
+                "messageIndex": 2,
+            },
+            {
+                "exercises": [{"category": "UNKNOWN", "name": None, "probability": 98.8}],
+                "duration": 3.0,
+                "repetitionCount": 0,
+                "weight": 0.0,
+                "setType": "ACTIVE",
+                "startTime": "2026-10-05T15:03:18.0",
+                "messageIndex": 3,
+            },
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_set_activity_exercise_sets_maps_onto_recorded_sets(
+    app_with_activity_management, mock_garmin_client
+):
+    """Entries replace active sets in order; rest sets and timings are kept"""
+    mock_garmin_client.garmin_connect_activity = "/activity-service/activity"
+    mock_garmin_client.get_activity_exercise_sets.return_value = _recorded_exercise_sets()
+
+    result = await app_with_activity_management.call_tool(
+        "set_activity_exercise_sets",
+        {
+            "activity_id": 12345678901,
+            "sets": [
+                {"category": "bench_press", "reps": 15, "weight_kg": 10},
+                {"category": "ROW", "name": "T_BAR_ROW", "reps": 10, "weight_kg": 22.5},
+                {"rest": True},
+            ],
+        },
+    )
+
+    mock_garmin_client.client.put.assert_called_once()
+    args, kwargs = mock_garmin_client.client.put.call_args
+    assert args == ("connectapi", "/activity-service/activity/12345678901/exerciseSets")
+    body = kwargs["json"]
+    assert body["activityId"] == 12345678901
+    sent = body["exerciseSets"]
+    assert len(sent) == 4
+
+    assert sent[0]["exercises"] == [
+        {"category": "BENCH_PRESS", "name": None, "probability": 100.0}
+    ]
+    assert sent[0]["repetitionCount"] == 15
+    assert sent[0]["weight"] == 10000.0  # Garmin stores grams
+    assert sent[0]["duration"] == 30.0
+    assert sent[0]["startTime"] == "2026-10-05T15:00:38.0"
+
+    assert sent[1] == _recorded_exercise_sets()["exerciseSets"][1]
+
+    assert sent[2]["exercises"][0]["name"] == "T_BAR_ROW"
+    assert sent[2]["weight"] == 22500.0
+
+    assert sent[3]["setType"] == "REST"
+    assert sent[3]["exercises"] == []
+    assert sent[3]["repetitionCount"] is None
+
+    data = json.loads(result[0][0].text)
+    assert data["success"] is True
+    assert data["active_sets"] == [
+        {"category": "BENCH_PRESS", "name": None, "reps": 15, "weight_kg": 10.0},
+        {"category": "ROW", "name": "T_BAR_ROW", "reps": 10, "weight_kg": 22.5},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_set_activity_exercise_sets_keeps_unspecified_reps_and_weight(
+    app_with_activity_management, mock_garmin_client
+):
+    """Omitting reps or weight_kg leaves the recorded value in place"""
+    mock_garmin_client.garmin_connect_activity = "/activity-service/activity"
+    mock_garmin_client.get_activity_exercise_sets.return_value = _recorded_exercise_sets()
+
+    await app_with_activity_management.call_tool(
+        "set_activity_exercise_sets",
+        {
+            "activity_id": 12345678901,
+            "sets": [
+                {"category": "PUSH_UP"},
+                {"category": "SQUAT", "weight_kg": 60},
+                {"category": "PLANK", "reps": 1},
+            ],
+        },
+    )
+
+    sent = mock_garmin_client.client.put.call_args.kwargs["json"]["exerciseSets"]
+    assert sent[0]["repetitionCount"] == 14
+    assert sent[0]["weight"] == 0.0
+    assert sent[2]["repetitionCount"] == 7
+    assert sent[2]["weight"] == 60000.0
+
+
+@pytest.mark.asyncio
+async def test_set_activity_exercise_sets_rejects_count_mismatch(
+    app_with_activity_management, mock_garmin_client
+):
+    """One entry per recorded active set is required; nothing is sent otherwise"""
+    mock_garmin_client.get_activity_exercise_sets.return_value = _recorded_exercise_sets()
+
+    result = await app_with_activity_management.call_tool(
+        "set_activity_exercise_sets",
+        {"activity_id": 12345678901, "sets": [{"category": "SQUAT", "reps": 5}]},
+    )
+
+    mock_garmin_client.client.put.assert_not_called()
+    assert "3 active sets" in result[0][0].text
+    assert "got 1" in result[0][0].text
+
+
+@pytest.mark.asyncio
+async def test_set_activity_exercise_sets_requires_category(
+    app_with_activity_management, mock_garmin_client
+):
+    """An entry that is not a rest needs a category"""
+    mock_garmin_client.get_activity_exercise_sets.return_value = _recorded_exercise_sets()
+
+    result = await app_with_activity_management.call_tool(
+        "set_activity_exercise_sets",
+        {
+            "activity_id": 12345678901,
+            "sets": [{"reps": 5}, {"category": "SQUAT"}, {"rest": True}],
+        },
+    )
+
+    mock_garmin_client.client.put.assert_not_called()
+    assert "set 1" in result[0][0].text
+    assert "category" in result[0][0].text
+
+
+@pytest.mark.asyncio
+async def test_set_activity_exercise_sets_explains_invalid_sub_category(
+    app_with_activity_management, mock_garmin_client
+):
+    """Garmin's opaque sub-category error gets an actionable hint"""
+    mock_garmin_client.garmin_connect_activity = "/activity-service/activity"
+    mock_garmin_client.get_activity_exercise_sets.return_value = _recorded_exercise_sets()
+    mock_garmin_client.client.put.side_effect = Exception(
+        "API Error 400 - Invalid Sub-Category Passed in the request"
+    )
+
+    result = await app_with_activity_management.call_tool(
+        "set_activity_exercise_sets",
+        {
+            "activity_id": 12345678901,
+            "sets": [
+                {"category": "BENCH_PRESS", "name": "BENCH_PRESS"},
+                {"category": "SQUAT"},
+                {"rest": True},
+            ],
+        },
+    )
+
+    text = result[0][0].text
+    assert "Invalid Sub-Category" in text
+    assert "name" in text and "null" in text
+
+
 @pytest.mark.asyncio
 async def test_count_activities_tool(app_with_activity_management, mock_garmin_client):
     """Test count_activities tool returns total activity count"""
