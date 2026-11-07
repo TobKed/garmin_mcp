@@ -801,6 +801,162 @@ async def test_set_activity_exercise_sets_explains_invalid_sub_category(
     assert "name" in text and "null" in text
 
 
+async def _replace(app, sets):
+    result = await app.call_tool(
+        "replace_activity_exercise_sets", {"activity_id": 12345678901, "sets": sets}
+    )
+    return result[0][0].text
+
+
+@pytest.mark.asyncio
+async def test_replace_activity_exercise_sets_splits_and_adds_sets(
+    app_with_activity_management, mock_garmin_client
+):
+    """The list replaces the recorded sets; untimed parts of a split share its time"""
+    mock_garmin_client.garmin_connect_activity = "/activity-service/activity"
+    mock_garmin_client.get_activity_exercise_sets.return_value = _recorded_exercise_sets()
+
+    text = await _replace(
+        app_with_activity_management,
+        [
+            {"category": "push_up", "name": "PIKE_PUSH_UP", "reps": 3,
+             "start_time": "2026-10-05T15:00:38Z"},
+            {"category": "PUSH_UP", "name": "INCLINE_PUSH_UP", "reps": 10},
+            {"type": "REST", "start_time": "2026-10-05T15:01:08Z", "duration_s": 90},
+            {"category": "SQUAT", "reps": 7, "weight_kg": 60, "duration_s": 40},
+            {"type": "REST", "duration_s": 3},
+        ],
+    )
+
+    sent = mock_garmin_client.client.put.call_args.kwargs["json"]["exerciseSets"]
+    assert [(s["setType"], s["startTime"], s["duration"]) for s in sent] == [
+        ("ACTIVE", "2026-10-05T15:00:38.0", 15.0),
+        ("ACTIVE", "2026-10-05T15:00:53.0", 15.0),
+        ("REST", "2026-10-05T15:01:08.0", 90.0),
+        ("ACTIVE", "2026-10-05T15:02:38.0", 40.0),
+        ("REST", "2026-10-05T15:03:18.0", 3.0),
+    ]
+    assert sent[0]["exercises"] == [
+        {"category": "PUSH_UP", "name": "PIKE_PUSH_UP", "probability": 100.0}
+    ]
+    assert sent[3]["weight"] == 60000.0
+    assert [s["messageIndex"] for s in sent] == [0, 1, 2, 3, 4]
+
+    data = json.loads(text)
+    assert data["names_dropped"] == []
+    assert len(data["backup"]) == 4
+    assert data["backup"][2] == {
+        "type": "ACTIVE", "category": "SQUAT", "name": None, "reps": 7,
+        "weight_kg": 0.0, "start_time": "2026-10-05T15:02:38Z", "duration_s": 40.0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_replace_activity_exercise_sets_backup_restores_recorded_timeline(
+    app_with_activity_management, mock_garmin_client
+):
+    """Passing the returned backup back writes the original timeline again"""
+    mock_garmin_client.garmin_connect_activity = "/activity-service/activity"
+    recorded = _recorded_exercise_sets()
+    mock_garmin_client.get_activity_exercise_sets.return_value = recorded
+
+    text = await _replace(
+        app_with_activity_management, [{"category": "SQUAT", "duration_s": 10}]
+    )
+    await _replace(app_with_activity_management, json.loads(text)["backup"])
+
+    sent = mock_garmin_client.client.put.call_args.kwargs["json"]["exerciseSets"]
+    assert [(s["setType"], s["startTime"], s["duration"], s["repetitionCount"]) for s in sent] == [
+        (s["setType"], s["startTime"], s["duration"], s["repetitionCount"])
+        for s in recorded["exerciseSets"]
+    ]
+
+
+@pytest.mark.parametrize(
+    "sets, expected",
+    [
+        (
+            [{"category": "SQUAT", "start_time": "2026-10-05T15:01:00Z", "duration_s": 30},
+             {"category": "SQUAT", "start_time": "2026-10-05T15:01:10Z", "duration_s": 5}],
+            "set 2: starts at",
+        ),
+        ([{"category": "SQUAT", "start_time": "2026-10-05T15:03:00Z", "duration_s": 60}],
+         "after the activity ends"),
+        ([{"type": "ACTIVE", "reps": 5}], "set 1: category is required"),
+        ([{"category": "SQUAT", "reps": -1}], "reps must be >= 0"),
+        ([{"category": "SQUAT", "weight_kg": -5}], "weight_kg must be >= 0"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_replace_activity_exercise_sets_validates_before_writing(
+    app_with_activity_management, mock_garmin_client, sets, expected
+):
+    mock_garmin_client.get_activity_exercise_sets.return_value = _recorded_exercise_sets()
+
+    text = await _replace(app_with_activity_management, sets)
+
+    mock_garmin_client.client.put.assert_not_called()
+    assert expected in text
+
+
+@pytest.mark.asyncio
+async def test_replace_activity_exercise_sets_retries_without_rejected_names(
+    app_with_activity_management, mock_garmin_client
+):
+    """A Sub-Category rejection drops names and retries instead of failing"""
+    mock_garmin_client.garmin_connect_activity = "/activity-service/activity"
+    mock_garmin_client.get_activity_exercise_sets.return_value = _recorded_exercise_sets()
+    mock_garmin_client.client.put.side_effect = [
+        Exception("API Error 400 - Invalid Sub-Category Passed in the request"),
+        None,
+    ]
+
+    text = await _replace(
+        app_with_activity_management,
+        [
+            {"category": "BENCH_PRESS", "name": "BENCH_PRESS"},
+            {"category": "PUSH_UP", "name": "PIKE_PUSH_UP"},
+            {"category": "SQUAT"},
+        ],
+    )
+
+    data = json.loads(text)
+    assert data["names_dropped"] == [
+        {"set": 1, "name": "BENCH_PRESS"},
+        {"set": 2, "name": "PIKE_PUSH_UP"},
+    ]
+    assert mock_garmin_client.client.put.call_count == 2
+    sent = mock_garmin_client.client.put.call_args.kwargs["json"]["exerciseSets"]
+    assert all(s["exercises"][0]["name"] is None for s in sent)
+
+
+@pytest.mark.asyncio
+async def test_get_exercise_catalog_filters_category_and_flags_rejected(
+    app_with_activity_management, monkeypatch
+):
+    response = Mock()
+    response.json.return_value = {
+        "categories": {
+            "PUSH_UP": {"exercises": {"PIKE_PUSH_UP": {}, "INCLINE_PUSH_UP": {}}},
+            "BENCH_PRESS": {"exercises": {"BENCH_PRESS": {}}},
+        }
+    }
+    monkeypatch.setattr(activity_management.requests, "get", Mock(return_value=response))
+
+    result = await app_with_activity_management.call_tool("get_exercise_catalog", {})
+    data = json.loads(result[0][0].text)
+    assert data["known_rejected"] == ["BENCH_PRESS/BENCH_PRESS"]
+
+    result = await app_with_activity_management.call_tool(
+        "get_exercise_catalog", {"category": "push_up"}
+    )
+    data = json.loads(result[0][0].text)
+    assert data == {
+        "categories": {"PUSH_UP": ["INCLINE_PUSH_UP", "PIKE_PUSH_UP"]},
+        "known_rejected": [],
+    }
+
+
 @pytest.mark.asyncio
 async def test_count_activities_tool(app_with_activity_management, mock_garmin_client):
     """Test count_activities tool returns total activity count"""

@@ -5,6 +5,8 @@ import json
 import datetime
 from typing import Any, Dict, List, Optional, Union
 
+import requests
+
 # The garmin_client will be set by the main file
 garmin_client = None
 
@@ -41,6 +43,95 @@ def _update_activity_summary(activity_id: int, fields: Dict[str, Any]) -> Any:
     sidesteps it.
     """
     return _put_activity_update(activity_id, {"summaryDTO": fields})
+
+
+EXERCISE_CATALOG_URL = "https://connect.garmin.com/web-data/exercises/Exercises.json"
+# Catalog names that Garmin's exerciseSets endpoint rejects with
+# "Invalid Sub-Category". Add pairs here as they turn up.
+KNOWN_REJECTED_EXERCISES = {("BENCH_PRESS", "BENCH_PRESS")}
+# Watch start times are whole seconds, so recorded sets overlap by up to ~1 s.
+_SET_TIME_TOLERANCE = datetime.timedelta(seconds=1)
+
+
+def _parse_set_time(value: str) -> datetime.datetime:
+    """Parse '2026-11-05T15:51:28Z' / '...28.0' (UTC) to a naive datetime."""
+    return datetime.datetime.strptime(
+        value.strip().rstrip("Z").split(".")[0], "%Y-%m-%dT%H:%M:%S"
+    )
+
+
+def _recorded_to_entry(recorded_set: Dict[str, Any]) -> Dict[str, Any]:
+    """A stored set in replace_activity_exercise_sets input form (for undo)."""
+    exercise = (recorded_set.get("exercises") or [{}])[0]
+    weight = recorded_set.get("weight")
+    return {
+        "type": recorded_set.get("setType"),
+        "category": exercise.get("category"),
+        "name": exercise.get("name"),
+        "reps": recorded_set.get("repetitionCount"),
+        "weight_kg": weight / 1000 if weight is not None else None,
+        "start_time": recorded_set["startTime"].split(".")[0] + "Z",
+        "duration_s": recorded_set.get("duration"),
+    }
+
+
+def _plan_set_times(entries, activity_start, activity_end):
+    """Resolve (start, duration) for every entry, then validate the timeline.
+
+    Entries with a start_time open a block; following entries without one
+    belong to it. Within a block, entries with duration_s keep it and the rest
+    share the remaining time up to the next block (or the activity end) evenly,
+    so splitting a set into two untimed entries halves it, and an entry with
+    only a duration goes right after the one before it.
+    """
+    starts = [_parse_set_time(e["start_time"]) if e.get("start_time") else None for e in entries]
+    if starts and starts[0] is None:
+        starts[0] = activity_start
+    anchors = [i for i, s in enumerate(starts) if s is not None] + [len(entries)]
+    planned = []
+    for a, b in zip(anchors, anchors[1:]):
+        block = entries[a:b]
+        window_end = starts[b] if b < len(entries) else activity_end
+        durations = [e.get("duration_s") for e in block]
+        fixed = sum(float(d) for d in durations if d is not None)
+        free = durations.count(None)
+        share = ((window_end - starts[a]).total_seconds() - fixed) / free if free else 0
+        if free and share <= 0:
+            raise ValueError(f"set {a + 1}: no time left to place the untimed sets after it")
+        t = starts[a]
+        for d in durations:
+            d = float(d) if d is not None else share
+            planned.append((t, d))
+            t += datetime.timedelta(seconds=d)
+
+    prev_end = activity_start
+    for number, (start, duration) in enumerate(planned, start=1):
+        end = start + datetime.timedelta(seconds=duration)
+        if duration <= 0:
+            raise ValueError(f"set {number}: duration_s must be > 0")
+        if start < prev_end - _SET_TIME_TOLERANCE:
+            raise ValueError(
+                f"set {number}: starts at {start.isoformat()}Z, before the previous "
+                f"set ends ({prev_end.isoformat()}Z); sets must be in time order "
+                "without overlaps"
+            )
+        if end > activity_end + _SET_TIME_TOLERANCE:
+            raise ValueError(
+                f"set {number}: ends at {end.isoformat()}Z, after the activity ends "
+                f"({activity_end.isoformat()}Z)"
+            )
+        prev_end = end
+    return planned
+
+
+def _fetch_exercise_catalog() -> Dict[str, List[str]]:
+    """Garmin's public strength exercise catalog as {category: [names]}."""
+    response = requests.get(EXERCISE_CATALOG_URL, timeout=30)
+    response.raise_for_status()
+    return {
+        category: sorted(details.get("exercises") or {})
+        for category, details in response.json()["categories"].items()
+    }
 
 
 def register_tools(app):
@@ -898,6 +989,163 @@ def register_tools(app):
                     "the affected sets."
                 )
             return message
+
+    @app.tool()
+    async def replace_activity_exercise_sets(
+        activity_id: Union[int, str], sets: List[Dict[str, Any]]
+    ) -> str:
+        """Rewrite a strength activity's sets in full: add, remove, split, merge, re-time.
+
+        Unlike set_activity_exercise_sets, the list replaces everything the watch
+        recorded and can have any length. Pass ACTIVE and REST sets in time order:
+          {"type": "ACTIVE", "category": "PUSH_UP", "name": "PIKE_PUSH_UP",
+           "reps": 3, "weight_kg": null,
+           "start_time": "2026-11-05T15:51:28Z", "duration_s": 20}
+          {"type": "REST", "start_time": "2026-11-05T15:51:48Z", "duration_s": 5}
+        type defaults to ACTIVE; category is required for ACTIVE sets, name is
+        optional (see get_exercise_catalog). start_time (UTC) and duration_s are
+        optional: an entry without start_time follows the entry before it, and
+        untimed entries share the time up to the next timed entry (or the activity
+        end) evenly. So to split a recorded set, keep its start_time on the first
+        part and leave both parts without duration_s.
+
+        Sets must stay inside the recorded activity, in order, without overlaps.
+        If Garmin rejects an exercise name, the write is retried with names
+        dropped (name null) and the affected sets are listed in names_dropped.
+
+        Returns the stored sets plus "backup": the previous sets in this tool's
+        input form. Pass the backup back to this tool to undo.
+
+        Args:
+            activity_id: ID of the strength activity to update
+            sets: The complete, ordered list of sets to store
+        """
+        try:
+            activity_id = int(activity_id)
+            recorded = (garmin_client.get_activity_exercise_sets(activity_id) or {}).get(
+                "exerciseSets"
+            ) or []
+            if not recorded:
+                return f"Activity {activity_id} has no recorded exercise sets to replace."
+            if not sets:
+                return "sets must contain at least one set."
+            backup = [_recorded_to_entry(s) for s in recorded]
+            # ponytail: the activity window is taken as the span of the recorded
+            # sets, which covers the whole activity on the watches seen so far.
+            # Read summaryDTO.startTimeGMT/elapsedDuration if that stops holding.
+            activity_start = _parse_set_time(recorded[0]["startTime"])
+            activity_end = max(
+                _parse_set_time(s["startTime"])
+                + datetime.timedelta(seconds=s.get("duration") or 0)
+                for s in recorded
+            )
+
+            exercise_sets = []
+            names_dropped = []
+            for number, entry in enumerate(sets, start=1):
+                set_type = (entry.get("type") or "ACTIVE").strip().upper()
+                if set_type not in ("ACTIVE", "REST"):
+                    return f"set {number}: type must be ACTIVE or REST, got {set_type}"
+                reps, weight_kg = entry.get("reps"), entry.get("weight_kg")
+                if reps is not None and int(reps) < 0:
+                    return f"set {number}: reps must be >= 0"
+                if weight_kg is not None and float(weight_kg) < 0:
+                    return f"set {number}: weight_kg must be >= 0"
+                exercises = []
+                if set_type == "ACTIVE":
+                    category = (entry.get("category") or "").strip().upper()
+                    if not category:
+                        return f"set {number}: category is required for ACTIVE sets"
+                    name = (entry.get("name") or "").strip().upper() or None
+                    if (category, name) in KNOWN_REJECTED_EXERCISES:
+                        names_dropped.append({"set": number, "name": name})
+                        name = None
+                    exercises = [{"category": category, "name": name, "probability": 100.0}]
+                exercise_sets.append(
+                    {
+                        "exercises": exercises,
+                        "repetitionCount": int(reps) if reps is not None and set_type == "ACTIVE" else None,
+                        "weight": float(weight_kg) * 1000 if weight_kg is not None and set_type == "ACTIVE" else None,
+                        "setType": set_type,
+                        "wktStepIndex": None,
+                        "messageIndex": number - 1,
+                    }
+                )
+
+            try:
+                planned = _plan_set_times(sets, activity_start, activity_end)
+            except ValueError as e:
+                return str(e)
+            for exercise_set, (start, duration) in zip(exercise_sets, planned):
+                start = start + datetime.timedelta(microseconds=500_000)  # round
+                exercise_set["startTime"] = start.strftime("%Y-%m-%dT%H:%M:%S") + ".0"
+                exercise_set["duration"] = round(duration, 3)
+
+            url = f"{garmin_client.garmin_connect_activity}/{activity_id}/exerciseSets"
+            body = {"activityId": activity_id, "exerciseSets": exercise_sets}
+            try:
+                garmin_client.client.put("connectapi", url, json=body)
+            except Exception as e:
+                if "Sub-Category" not in str(e):
+                    raise
+                # ponytail: Garmin doesn't say which name it rejected, so every
+                # name is dropped; retry per set if keeping valid names matters.
+                for number, exercise_set in enumerate(exercise_sets, start=1):
+                    for exercise in exercise_set["exercises"]:
+                        if exercise["name"]:
+                            names_dropped.append({"set": number, "name": exercise["name"]})
+                            exercise["name"] = None
+                garmin_client.client.put("connectapi", url, json=body)
+
+            stored = garmin_client.get_activity_exercise_sets(activity_id) or {}
+            return json.dumps(
+                {
+                    "success": True,
+                    "activity_id": activity_id,
+                    "names_dropped": names_dropped,
+                    "exerciseSets": [
+                        {k: v for k, v in s.items() if v is not None}
+                        for s in stored.get("exerciseSets") or []
+                    ],
+                    "backup": backup,
+                },
+                indent=2,
+            )
+        except Exception as e:
+            return f"Error replacing activity exercise sets: {str(e)}"
+
+    @app.tool()
+    async def get_exercise_catalog(category: Optional[str] = None) -> str:
+        """List the strength exercise names Garmin knows, by category.
+
+        Use it to pick category/name pairs for set_activity_exercise_sets,
+        replace_activity_exercise_sets and create_strength_workout. A category
+        with name null is always accepted. known_rejected lists catalog names
+        that Garmin's set editor still rejects.
+
+        Args:
+            category: Optional category (e.g. PUSH_UP) to list only its names
+        """
+        try:
+            catalog = _fetch_exercise_catalog()
+            known_rejected = sorted(f"{c}/{n}" for c, n in KNOWN_REJECTED_EXERCISES)
+            if category:
+                category = category.strip().upper()
+                if category not in catalog:
+                    return json.dumps(
+                        {
+                            "error": f"Unknown category {category}",
+                            "categories": sorted(catalog),
+                        },
+                        indent=2,
+                    )
+                catalog = {category: catalog[category]}
+                known_rejected = [r for r in known_rejected if r.startswith(f"{category}/")]
+            return json.dumps(
+                {"categories": catalog, "known_rejected": known_rejected}, indent=2
+            )
+        except Exception as e:
+            return f"Error retrieving exercise catalog: {str(e)}"
 
     @app.tool()
     async def count_activities() -> str:
