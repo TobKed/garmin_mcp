@@ -801,7 +801,9 @@ async def test_set_activity_exercise_sets_explains_invalid_sub_category(
     assert "name" in text and "null" in text
 
 
-async def _replace(app, sets):
+async def _replace(app, client, sets):
+    client.garmin_connect_activity = "/activity-service/activity"
+    client.get_activity_exercise_sets.return_value = _recorded_exercise_sets()
     result = await app.call_tool(
         "replace_activity_exercise_sets", {"activity_id": 12345678901, "sets": sets}
     )
@@ -813,11 +815,9 @@ async def test_replace_activity_exercise_sets_splits_and_adds_sets(
     app_with_activity_management, mock_garmin_client
 ):
     """The list replaces the recorded sets; untimed parts of a split share its time"""
-    mock_garmin_client.garmin_connect_activity = "/activity-service/activity"
-    mock_garmin_client.get_activity_exercise_sets.return_value = _recorded_exercise_sets()
-
     text = await _replace(
         app_with_activity_management,
+        mock_garmin_client,
         [
             {"category": "push_up", "name": "PIKE_PUSH_UP", "reps": 3,
              "start_time": "2026-10-05T15:00:38Z"},
@@ -856,14 +856,11 @@ async def test_replace_activity_exercise_sets_backup_restores_recorded_timeline(
     app_with_activity_management, mock_garmin_client
 ):
     """Passing the returned backup back writes the original timeline again"""
-    mock_garmin_client.garmin_connect_activity = "/activity-service/activity"
     recorded = _recorded_exercise_sets()
-    mock_garmin_client.get_activity_exercise_sets.return_value = recorded
-
     text = await _replace(
-        app_with_activity_management, [{"category": "SQUAT", "duration_s": 10}]
+        app_with_activity_management, mock_garmin_client, [{"category": "SQUAT", "duration_s": 10}]
     )
-    await _replace(app_with_activity_management, json.loads(text)["backup"])
+    await _replace(app_with_activity_management, mock_garmin_client, json.loads(text)["backup"])
 
     sent = mock_garmin_client.client.put.call_args.kwargs["json"]["exerciseSets"]
     assert [(s["setType"], s["startTime"], s["duration"], s["repetitionCount"]) for s in sent] == [
@@ -891,9 +888,7 @@ async def test_replace_activity_exercise_sets_backup_restores_recorded_timeline(
 async def test_replace_activity_exercise_sets_validates_before_writing(
     app_with_activity_management, mock_garmin_client, sets, expected
 ):
-    mock_garmin_client.get_activity_exercise_sets.return_value = _recorded_exercise_sets()
-
-    text = await _replace(app_with_activity_management, sets)
+    text = await _replace(app_with_activity_management, mock_garmin_client, sets)
 
     mock_garmin_client.client.put.assert_not_called()
     assert expected in text
@@ -904,8 +899,6 @@ async def test_replace_activity_exercise_sets_retries_without_rejected_names(
     app_with_activity_management, mock_garmin_client
 ):
     """A Sub-Category rejection drops names and retries instead of failing"""
-    mock_garmin_client.garmin_connect_activity = "/activity-service/activity"
-    mock_garmin_client.get_activity_exercise_sets.return_value = _recorded_exercise_sets()
     mock_garmin_client.client.put.side_effect = [
         Exception("API Error 400 - Invalid Sub-Category Passed in the request"),
         None,
@@ -913,6 +906,7 @@ async def test_replace_activity_exercise_sets_retries_without_rejected_names(
 
     text = await _replace(
         app_with_activity_management,
+        mock_garmin_client,
         [
             {"category": "BENCH_PRESS", "name": "BENCH_PRESS"},
             {"category": "PUSH_UP", "name": "PIKE_PUSH_UP"},
@@ -942,6 +936,7 @@ async def test_get_exercise_catalog_filters_category_and_flags_rejected(
         }
     }
     monkeypatch.setattr(activity_management.requests, "get", Mock(return_value=response))
+    activity_management._fetch_exercise_catalog.cache_clear()
 
     result = await app_with_activity_management.call_tool("get_exercise_catalog", {})
     data = json.loads(result[0][0].text)

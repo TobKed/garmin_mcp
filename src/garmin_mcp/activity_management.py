@@ -1,8 +1,9 @@
 """
 Activity Management functions for Garmin Connect MCP Server
 """
-import json
 import datetime
+import functools
+import json
 from typing import Any, Dict, List, Optional, Union
 
 import requests
@@ -51,6 +52,15 @@ EXERCISE_CATALOG_URL = "https://connect.garmin.com/web-data/exercises/Exercises.
 KNOWN_REJECTED_EXERCISES = {("BENCH_PRESS", "BENCH_PRESS")}
 # Watch start times are whole seconds, so recorded sets overlap by up to ~1 s.
 _SET_TIME_TOLERANCE = datetime.timedelta(seconds=1)
+
+
+def _exercise(category: str, name: Optional[str]) -> Dict[str, Any]:
+    """An exerciseSets exercise entry with category and name upper-cased."""
+    return {
+        "category": category.strip().upper(),
+        "name": (name or "").strip().upper() or None,
+        "probability": 100.0,
+    }
 
 
 def _parse_set_time(value: str) -> datetime.datetime:
@@ -106,9 +116,9 @@ def _plan_set_times(entries, activity_start, activity_end):
 
     prev_end = activity_start
     for number, (start, duration) in enumerate(planned, start=1):
-        end = start + datetime.timedelta(seconds=duration)
         if duration <= 0:
             raise ValueError(f"set {number}: duration_s must be > 0")
+        end = start + datetime.timedelta(seconds=duration)
         if start < prev_end - _SET_TIME_TOLERANCE:
             raise ValueError(
                 f"set {number}: starts at {start.isoformat()}Z, before the previous "
@@ -124,6 +134,7 @@ def _plan_set_times(entries, activity_start, activity_end):
     return planned
 
 
+@functools.lru_cache(maxsize=1)
 def _fetch_exercise_catalog() -> Dict[str, List[str]]:
     """Garmin's public strength exercise catalog as {category: [names]}."""
     response = requests.get(EXERCISE_CATALOG_URL, timeout=30)
@@ -944,14 +955,7 @@ def register_tools(app):
                 category = (entry.get("category") or "").strip().upper()
                 if not category:
                     return f"set {number}: category is required unless rest is true"
-                name = entry.get("name")
-                recorded_set["exercises"] = [
-                    {
-                        "category": category,
-                        "name": name.strip().upper() if name else None,
-                        "probability": 100.0,
-                    }
-                ]
+                recorded_set["exercises"] = [_exercise(category, entry.get("name"))]
                 if entry.get("reps") is not None:
                     recorded_set["repetitionCount"] = int(entry["reps"])
                 if entry.get("weight_kg") is not None:
@@ -1046,26 +1050,29 @@ def register_tools(app):
                 set_type = (entry.get("type") or "ACTIVE").strip().upper()
                 if set_type not in ("ACTIVE", "REST"):
                     return f"set {number}: type must be ACTIVE or REST, got {set_type}"
-                reps, weight_kg = entry.get("reps"), entry.get("weight_kg")
-                if reps is not None and int(reps) < 0:
+                reps = int(entry["reps"]) if entry.get("reps") is not None else None
+                weight_kg = entry.get("weight_kg")
+                weight = float(weight_kg) * 1000 if weight_kg is not None else None
+                if reps is not None and reps < 0:
                     return f"set {number}: reps must be >= 0"
-                if weight_kg is not None and float(weight_kg) < 0:
+                if weight is not None and weight < 0:
                     return f"set {number}: weight_kg must be >= 0"
                 exercises = []
                 if set_type == "ACTIVE":
-                    category = (entry.get("category") or "").strip().upper()
-                    if not category:
+                    if not (entry.get("category") or "").strip():
                         return f"set {number}: category is required for ACTIVE sets"
-                    name = (entry.get("name") or "").strip().upper() or None
-                    if (category, name) in KNOWN_REJECTED_EXERCISES:
-                        names_dropped.append({"set": number, "name": name})
-                        name = None
-                    exercises = [{"category": category, "name": name, "probability": 100.0}]
+                    exercise = _exercise(entry["category"], entry.get("name"))
+                    if (exercise["category"], exercise["name"]) in KNOWN_REJECTED_EXERCISES:
+                        names_dropped.append({"set": number, "name": exercise["name"]})
+                        exercise["name"] = None
+                    exercises = [exercise]
+                else:
+                    reps = weight = None
                 exercise_sets.append(
                     {
                         "exercises": exercises,
-                        "repetitionCount": int(reps) if reps is not None and set_type == "ACTIVE" else None,
-                        "weight": float(weight_kg) * 1000 if weight_kg is not None and set_type == "ACTIVE" else None,
+                        "repetitionCount": reps,
+                        "weight": weight,
                         "setType": set_type,
                         "wktStepIndex": None,
                         "messageIndex": number - 1,
@@ -1091,10 +1098,10 @@ def register_tools(app):
                 # ponytail: Garmin doesn't say which name it rejected, so every
                 # name is dropped; retry per set if keeping valid names matters.
                 for number, exercise_set in enumerate(exercise_sets, start=1):
-                    for exercise in exercise_set["exercises"]:
-                        if exercise["name"]:
-                            names_dropped.append({"set": number, "name": exercise["name"]})
-                            exercise["name"] = None
+                    exercise = (exercise_set["exercises"] or [{}])[0]
+                    if exercise.get("name"):
+                        names_dropped.append({"set": number, "name": exercise["name"]})
+                        exercise["name"] = None
                 garmin_client.client.put("connectapi", url, json=body)
 
             stored = garmin_client.get_activity_exercise_sets(activity_id) or {}
@@ -1128,7 +1135,7 @@ def register_tools(app):
         """
         try:
             catalog = _fetch_exercise_catalog()
-            known_rejected = sorted(f"{c}/{n}" for c, n in KNOWN_REJECTED_EXERCISES)
+            rejected = KNOWN_REJECTED_EXERCISES
             if category:
                 category = category.strip().upper()
                 if category not in catalog:
@@ -1140,9 +1147,13 @@ def register_tools(app):
                         indent=2,
                     )
                 catalog = {category: catalog[category]}
-                known_rejected = [r for r in known_rejected if r.startswith(f"{category}/")]
+                rejected = {(c, n) for c, n in rejected if c == category}
             return json.dumps(
-                {"categories": catalog, "known_rejected": known_rejected}, indent=2
+                {
+                    "categories": catalog,
+                    "known_rejected": sorted(f"{c}/{n}" for c, n in rejected),
+                },
+                indent=2
             )
         except Exception as e:
             return f"Error retrieving exercise catalog: {str(e)}"
